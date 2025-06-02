@@ -1,3 +1,5 @@
+import os
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, cast
@@ -6,7 +8,11 @@ import dns.resolver
 from datetime import datetime, timezone
 import ssl
 import socket
-import whois # Import dla WHOIS
+import whois
+import tldextract # Dla precyzyjnego wyodrębniania domeny
+
+from dotenv import load_dotenv
+load_dotenv() # Załaduj zmienne z .env, jeśli istnieje
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -15,13 +21,20 @@ from transformers.modeling_utils import PreTrainedModel
 import torch
 from fastapi.middleware.cors import CORSMiddleware
 
+from cachetools import TTLCache, Cache
+import json # Do serializacji/deserializacji obiektów Pydantic dla cache'u
+
+# --- Konfiguracja kluczy API i URL-i ---
+GOOGLE_SAFE_BROWSING_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "YOUR_GOOGLE_KEY_HERE_IF_NOT_IN_ENV")
+OPENPHISH_FEED_URL = "https://openphish.com/feed.txt"
+
 # --- Konfiguracja CORS ---
 app = FastAPI()
 origins = [
     "http://localhost:5173",    # Twój frontend Vite
     "http://127.0.0.1:8000",    # Adres, na którym działa Uvicorn
-    "chrome-extension://YOUR_EXTENSION_ID", # Zastąp rzeczywistym ID wtyczki Chrome
-    "moz-extension://YOUR_EXTENSION_UUID"    # Zastąp rzeczywistym UUID wtyczki Firefox
+    "chrome-extension://YOUR_CHROME_EXTENSION_ID_HERE", # Zastąp rzeczywistym ID wtyczki Chrome
+    "moz-extension://YOUR_FIREFOX_EXTENSION_UUID_HERE"    # Zastąp rzeczywistym UUID wtyczki Firefox
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -50,6 +63,9 @@ except Exception as e:
     print(f"Error loading model: {e}")
     tokenizer_instance = None
     model_instance = None
+
+# --- Konfiguracja Cache'u ---
+DOMAIN_ANALYSIS_CACHE: TTLCache[str, str] = TTLCache(maxsize=1024, ttl=3600)
 
 
 # --- Modele danych Pydantic ---
@@ -81,6 +97,11 @@ class WhoisInfo(BaseModel):
     emails: Optional[List[str]] = None
     status: Optional[List[str]] = None
 
+class BlacklistCheckResult(BaseModel):
+    source: str
+    is_listed: bool
+    details: Optional[Any] = None
+
 class DomainDetailsResponse(BaseModel):
     domain_name: Optional[str] = None
     parsed_url_scheme: Optional[str] = None
@@ -90,9 +111,84 @@ class DomainDetailsResponse(BaseModel):
     ssl_info: Optional[SSLInfo] = None
     whois_info: Optional[WhoisInfo] = None
     domain_actual_age_days: Optional[int] = None
+    blacklist_checks: Optional[List[BlacklistCheckResult]] = None
     is_ip_address_in_url: bool = False
     error: Optional[str] = None
 
+
+# --- Funkcje pomocnicze do sprawdzania list zagrożeń ---
+OPENPHISH_LOCAL_CACHE: List[str] = []
+OPENPHISH_CACHE_TIMESTAMP: Optional[datetime] = None
+OPENPHISH_CACHE_TTL_SECONDS = 3600
+
+def update_openphish_cache():
+    global OPENPHISH_LOCAL_CACHE, OPENPHISH_CACHE_TIMESTAMP
+    now = datetime.now(timezone.utc)
+    if OPENPHISH_CACHE_TIMESTAMP is None or (now - OPENPHISH_CACHE_TIMESTAMP).total_seconds() > OPENPHISH_CACHE_TTL_SECONDS:
+        try:
+            print(f"Attempting to update OpenPhish cache from {OPENPHISH_FEED_URL}...")
+            headers = {'User-Agent': 'IsThisPhishyApp/1.0 (compatible; Python Requests)'}
+            response = requests.get(OPENPHISH_FEED_URL, timeout=30, headers=headers)
+            response.raise_for_status()
+            new_entries = [line.strip() for line in response.text.splitlines() if line.strip()]
+            if new_entries:
+                OPENPHISH_LOCAL_CACHE = new_entries
+                OPENPHISH_CACHE_TIMESTAMP = now
+                print(f"OpenPhish cache updated successfully with {len(OPENPHISH_LOCAL_CACHE)} entries.")
+            else:
+                print("OpenPhish feed was empty. Cache not updated.")
+        except requests.exceptions.Timeout:
+            print(f"Timeout while updating OpenPhish cache from {OPENPHISH_FEED_URL}.")
+        except requests.exceptions.RequestException as e:
+            print(f"Error updating OpenPhish cache: {e}")
+
+def check_openphish(url_to_check: str) -> BlacklistCheckResult:
+    update_openphish_cache()
+    is_listed = url_to_check in OPENPHISH_LOCAL_CACHE
+    if is_listed:
+        print(f"URL '{url_to_check}' found in OpenPhish cache.")
+    return BlacklistCheckResult(source="OpenPhish", is_listed=is_listed, details={"match_found": is_listed, "cache_size": len(OPENPHISH_LOCAL_CACHE)})
+
+def check_google_safe_browsing(url_to_check: str) -> BlacklistCheckResult:
+    if not GOOGLE_SAFE_BROWSING_API_KEY or GOOGLE_SAFE_BROWSING_API_KEY.startswith("YOUR_"):
+        return BlacklistCheckResult(source="GoogleSafeBrowsing", is_listed=False, details="API key not configured")
+    api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SAFE_BROWSING_API_KEY}"
+    payload = {
+        "client": {"clientId": "isthisphishy-app", "clientVersion": "1.0.0"},
+        "threatInfo": {
+            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+            "platformTypes": ["ANY_PLATFORM"], "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url_to_check}]
+        }
+    }
+    try:
+        response = requests.post(api_url, json=payload, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        is_listed = 'matches' in data and len(data['matches']) > 0
+        return BlacklistCheckResult(source="GoogleSafeBrowsing", is_listed=is_listed, details=data.get('matches'))
+    except requests.RequestException as e:
+        print(f"Error checking Google Safe Browsing for {url_to_check}: {e}")
+        return BlacklistCheckResult(source="GoogleSafeBrowsing", is_listed=False, details=f"API request error: {e}")
+    except ValueError as e: # JSONDecodeError
+        print(f"Error decoding Google Safe Browsing JSON for {url_to_check}: {e}")
+        return BlacklistCheckResult(source="GoogleSafeBrowsing", is_listed=False, details=f"JSON decode error: {e}")
+
+def check_ip_dnsbl(ip_address: str, dnsbl_server: str = "zen.spamhaus.org") -> BlacklistCheckResult:
+    try:
+        reversed_ip = '.'.join(reversed(ip_address.split('.')))
+        query_domain = f"{reversed_ip}.{dnsbl_server}"
+        # print(f"Checking IP {ip_address} against DNSBL {dnsbl_server} (querying {query_domain})") # Zakomentowane dla czystszych logów
+        answers = dns.resolver.resolve(query_domain, 'A')
+        return BlacklistCheckResult(source=dnsbl_server, is_listed=True, details=[str(rdata) for rdata in answers])
+    except dns.resolver.NXDOMAIN:
+        return BlacklistCheckResult(source=dnsbl_server, is_listed=False)
+    except (dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.exception.Timeout) as e:
+        # print(f"DNSBL lookup error for IP {ip_address} on {dnsbl_server}: {e}") # Zakomentowane
+        return BlacklistCheckResult(source=dnsbl_server, is_listed=False, details=f"DNSBL lookup error: {e}")
+    except Exception as e:
+        # print(f"Unexpected error during DNSBL check for IP {ip_address} on {dnsbl_server}: {e}") # Zakomentowane
+        return BlacklistCheckResult(source=dnsbl_server, is_listed=False, details=f"Unexpected error: {e}")
 
 # --- Endpointy API ---
 @app.post("/api/v1/check_phishing_text", response_model=PhishingCheckResponse)
@@ -139,13 +235,13 @@ def format_rdn(rdn_sequence: Any) -> Optional[Dict[str, str]]:
                     formatted_dict[rdn[0]] = rdn[1]
         return formatted_dict if formatted_dict else None
     except Exception as e:
-        print(f"Error formatting RDN sequence: {e}, sequence was: {rdn_sequence}")
+        # print(f"Error formatting RDN sequence: {e}, sequence was: {rdn_sequence}") # Zakomentowane
         return None
 
 def get_ssl_certificate_info(hostname: str, port: int = 443) -> Optional[SSLInfo]:
     context = ssl.create_default_context()
     try:
-        with socket.create_connection((hostname, port), timeout=5) as sock:
+        with socket.create_connection((hostname, port), timeout=10) as sock: 
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert: Optional[Dict[str, Any]] = ssock.getpeercert()
                 if not cert: return None
@@ -168,45 +264,60 @@ def get_ssl_certificate_info(hostname: str, port: int = 443) -> Optional[SSLInfo
                 return SSLInfo(issuer=issuer_dict, subject=subject_dict, version=ssl_version,
                                serial_number=ssl_serial_number, not_before=ssl_not_before, not_after=ssl_not_after)
     except (socket.gaierror, socket.timeout, ConnectionRefusedError, ssl.SSLError, OSError, ValueError) as e:
-        print(f"SSL check error for {hostname}: {type(e).__name__} - {e}")
+        # print(f"SSL check error for {hostname}: {type(e).__name__} - {e}") # Zakomentowane
         return None
     except Exception as e:
-        print(f"Unexpected SSL check error for {hostname}: {type(e).__name__} - {e}")
+        # print(f"Unexpected SSL check error for {hostname}: {type(e).__name__} - {e}") # Zakomentowane
         return None
+
+def pydantic_encoder(obj: Any) -> Any:
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 @app.post("/api/v1/analyze_domain_details", response_model=DomainDetailsResponse)
 async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
+    cache_key = request.url
+    cached_response_json = DOMAIN_ANALYSIS_CACHE.get(cache_key)
+    if cached_response_json:
+        print(f"Cache hit for: {cache_key}")
+        try:
+            cached_data = json.loads(cached_response_json)
+            return DomainDetailsResponse(**cached_data)
+        except (json.JSONDecodeError, TypeError, Exception) as e: # TypeError dla Pydantic ValidationError
+            print(f"Error decoding/validating cached JSON for {cache_key}: {e}. Fetching fresh data.")
+            DOMAIN_ANALYSIS_CACHE.pop(cache_key, None)
+
+    print(f"Cache miss for: {cache_key}. Fetching fresh data.")
+    domain_name_from_url: Optional[str] = None 
     try:
         parsed_url = urlparse(request.url)
-        effective_url = request.url
+        effective_url_for_parsing = request.url
         if not parsed_url.scheme and not parsed_url.netloc and '.' in request.url:
-            effective_url = f"http://{request.url}" 
-            parsed_url = urlparse(effective_url)
+            effective_url_for_parsing = f"http://{request.url}"
+            parsed_url = urlparse(effective_url_for_parsing)
         
         domain_name_from_url = parsed_url.netloc
         if not domain_name_from_url:
             raise HTTPException(status_code=400, detail="Could not extract a valid domain/hostname from the URL.")
 
         is_ip_in_url = False
-        hostname_for_ssl_and_dns = domain_name_from_url.split(':')[0] 
+        hostname_for_ops = domain_name_from_url.split(':')[0]
         try:
-            socket.inet_aton(hostname_for_ssl_and_dns)
+            socket.inet_aton(hostname_for_ops)
             is_ip_in_url = True
         except socket.error: pass
 
-        domain_for_whois_query = hostname_for_ssl_and_dns
-        if hostname_for_ssl_and_dns.startswith("www."):
-            parts = hostname_for_ssl_and_dns.split('.', 1)
-            if len(parts) > 1:
-                domain_for_whois_query = parts[1]
+        extracted_domain_parts = tldextract.extract(hostname_for_ops)
+        domain_for_whois_query = ""
+        if extracted_domain_parts.registered_domain:
+            domain_for_whois_query = extracted_domain_parts.registered_domain
+        else:
+            domain_for_whois_query = hostname_for_ops 
         
-        parts_for_whois = domain_for_whois_query.split('.')
-        if len(parts_for_whois) > 2:
-            if parts_for_whois[-2].lower() in ['co', 'com', 'org', 'net', 'gov', 'edu', 'ac', 'nom', 'me', 'ltd'] and len(parts_for_whois) > 2 : # dodano popularne drugie poziomy
-                domain_for_whois_query = '.'.join(parts_for_whois[-3:])
-            else:
-                domain_for_whois_query = '.'.join(parts_for_whois[-2:])
-        
+        print(f"URL received: {request.url}")
+        print(f"Hostname for DNS/SSL: {hostname_for_ops}, Domain for WHOIS/ApexDNS: {domain_for_whois_query}")
+
         response_details = DomainDetailsResponse(
             domain_name=domain_name_from_url,
             parsed_url_scheme=parsed_url.scheme,
@@ -215,121 +326,108 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
             is_ip_address_in_url=is_ip_in_url
         )
 
-        # 1. Analiza DNS
-        dns_results: Dict[str, List[str]] = {}
-        if not is_ip_in_url and hostname_for_ssl_and_dns:
+        # --- DNS ---
+        dns_records_val: Dict[str, List[str]] = {}
+        if not is_ip_in_url and hostname_for_ops:
+            apex_domain_for_dns = domain_for_whois_query 
             fqdn_record_types = ['A', 'AAAA', 'CNAME']
             apex_fallback_record_types = ['MX', 'NS', 'TXT']
-
-            for record_type in fqdn_record_types:
-                try:
-                    if not hostname_for_ssl_and_dns: continue
-                    print(f"Attempting DNS lookup (FQDN) for: {hostname_for_ssl_and_dns} [{record_type}]")
-                    answers = dns.resolver.resolve(hostname_for_ssl_and_dns, record_type)
-                    dns_results[record_type] = [str(rdata) for rdata in answers]
-                except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.exception.Timeout, dns.resolver.YXDOMAIN) as e:
-                    print(f"DNS lookup (FQDN) for {hostname_for_ssl_and_dns} [{record_type}] failed as expected: {type(e).__name__} - {e}")
-                    dns_results[record_type] = [] 
-                except Exception as e:
-                    print(f"Unexpected DNS error (FQDN) for {hostname_for_ssl_and_dns} [{record_type}]: {type(e).__name__} - {e}")
-                    dns_results[record_type] = [f"Error: {str(e)}"]
-
-            for record_type in apex_fallback_record_types:
+            all_dns_types = fqdn_record_types + apex_fallback_record_types
+            for record_type in all_dns_types:
+                current_host_to_query = hostname_for_ops
                 resolved_values: Optional[List[str]] = None
-                # Najpierw spróbuj FQDN
                 try:
-                    if not hostname_for_ssl_and_dns: 
-                        dns_results[record_type] = [] # Jeśli nie ma FQDN, nie ma co próbować
-                        continue
-                    print(f"Attempting DNS lookup (FQDN) for: {hostname_for_ssl_and_dns} [{record_type}]")
-                    answers = dns.resolver.resolve(hostname_for_ssl_and_dns, record_type)
+                    # print(f"Attempting DNS lookup for: {current_host_to_query} [{record_type}]")
+                    answers = dns.resolver.resolve(current_host_to_query, record_type)
                     resolved_values = [str(rdata) for rdata in answers]
                 except dns.resolver.NoAnswer:
-                    # Używamy domain_for_whois_query jako naszej najlepszej próby dla "domeny głównej"
-                    # Upewnij się, że domain_for_whois_query jest sensowne i różne od hostname_for_ssl_and_dns
-                    if domain_for_whois_query and domain_for_whois_query != hostname_for_ssl_and_dns:
-                        print(f"DNS lookup (FQDN) for {hostname_for_ssl_and_dns} [{record_type}] gave NoAnswer. Trying apex domain: {domain_for_whois_query}")
+                    if record_type in apex_fallback_record_types and apex_domain_for_dns and apex_domain_for_dns != current_host_to_query:
+                        # print(f"DNS NoAnswer for {current_host_to_query} [{record_type}]. Trying apex: {apex_domain_for_dns}")
                         try:
-                            answers_apex = dns.resolver.resolve(domain_for_whois_query, record_type)
+                            answers_apex = dns.resolver.resolve(apex_domain_for_dns, record_type)
                             resolved_values = [str(rdata) for rdata in answers_apex]
-                        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.exception.Timeout, dns.resolver.YXDOMAIN) as e_apex:
-                            print(f"DNS lookup (Apex) for {domain_for_whois_query} [{record_type}] failed as expected: {type(e_apex).__name__} - {e_apex}")
-                            resolved_values = [] # Zdefiniuj jako puste, jeśli błąd
-                        except Exception as e_apex_other:
-                            print(f"Unexpected DNS error (Apex) for {domain_for_whois_query} [{record_type}]: {type(e_apex_other).__name__} - {e_apex_other}")
-                            resolved_values = [f"Error: {str(e_apex_other)}"]
-                    else: 
-                        resolved_values = [] # Zdefiniuj jako puste, jeśli nie ma co próbować dalej
-                except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout, dns.resolver.YXDOMAIN) as e_fqdn:
-                    print(f"DNS lookup (FQDN) for {hostname_for_ssl_and_dns} [{record_type}] failed as expected: {type(e_fqdn).__name__} - {e_fqdn}")
-                    resolved_values = [] # Zdefiniuj jako puste
-                except Exception as e_fqdn_other:
-                    print(f"Unexpected DNS error (FQDN) for {hostname_for_ssl_and_dns} [{record_type}]: {type(e_fqdn_other).__name__} - {e_fqdn_other}")
-                    resolved_values = [f"Error: {str(e_fqdn_other)}"]
-                
-                dns_results[record_type] = resolved_values if resolved_values is not None else []
-            
-            response_details.dns_records = dns_results
+                        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.exception.Timeout, dns.resolver.YXDOMAIN): resolved_values = []
+                        except Exception: resolved_values = ["Error: Apex DNS lookup failed"]
+                    else: resolved_values = []
+                except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout, dns.resolver.YXDOMAIN): resolved_values = []
+                except Exception: resolved_values = [f"Error: DNS lookup for {record_type} failed"]
+                dns_records_val[record_type] = resolved_values if resolved_values is not None else []
+            response_details.dns_records = dns_records_val
 
-        # 2. Analiza certyfikatu SSL - użyj hostname_for_ssl_and_dns
-        if (parsed_url.scheme == 'https' or (not parsed_url.scheme and not is_ip_in_url)) and hostname_for_ssl_and_dns:
-            ssl_info_val = get_ssl_certificate_info(hostname_for_ssl_and_dns)
-            response_details.ssl_info = ssl_info_val
+        # --- SSL ---
+        if (parsed_url.scheme == 'https' or (not parsed_url.scheme and not is_ip_in_url)) and hostname_for_ops:
+            response_details.ssl_info = get_ssl_certificate_info(hostname_for_ops)
         
-        # 3. Analiza WHOIS - użyj domain_for_whois_query
-        whois_data_obj = None
-        domain_age = None
+        # --- WHOIS ---
+        whois_info_val = None
+        domain_age_val = None
         if not is_ip_in_url and domain_for_whois_query:
             try:
-                print(f"Attempting WHOIS lookup for: {domain_for_whois_query}")
+                # print(f"Attempting WHOIS lookup for: {domain_for_whois_query}")
                 domain_whois_info = whois.whois(domain_for_whois_query)
-
-                if domain_whois_info and (domain_whois_info.domain_name or domain_whois_info.get('domain_name')):
-                    
+                if domain_whois_info and (getattr(domain_whois_info, 'domain_name', None) or domain_whois_info.get('domain_name')):
                     def normalize_date_list(date_val: Any) -> Optional[datetime]:
-                        if isinstance(date_val, list):
-                            return date_val[0] if date_val and isinstance(date_val[0], datetime) else None
-                        elif isinstance(date_val, datetime):
-                            return date_val
+                        if isinstance(date_val, list): return date_val[0] if date_val and isinstance(date_val[0], datetime) else None
+                        elif isinstance(date_val, datetime): return date_val
                         return None
-
                     creation_dt = normalize_date_list(getattr(domain_whois_info, 'creation_date', domain_whois_info.get('creation_date')))
                     expiration_dt = normalize_date_list(getattr(domain_whois_info, 'expiration_date', domain_whois_info.get('expiration_date')))
                     updated_dt = normalize_date_list(getattr(domain_whois_info, 'updated_date', domain_whois_info.get('updated_date')))
-                    
                     ns_list = getattr(domain_whois_info, 'name_servers', domain_whois_info.get('name_servers'))
                     emails_list = getattr(domain_whois_info, 'emails', domain_whois_info.get('emails'))
                     status_list = getattr(domain_whois_info, 'status', domain_whois_info.get('status'))
                     registrar_val = getattr(domain_whois_info, 'registrar', domain_whois_info.get('registrar'))
-
-                    whois_data_obj = WhoisInfo(
-                        registrar=str(registrar_val) if registrar_val else None,
-                        creation_date=creation_dt,
-                        expiration_date=expiration_dt,
-                        updated_date=updated_dt,
+                    whois_info_val = WhoisInfo(
+                        registrar=str(registrar_val) if registrar_val else None, creation_date=creation_dt, expiration_date=expiration_dt, updated_date=updated_dt,
                         name_servers=[str(ns).lower() for ns in ns_list] if isinstance(ns_list, list) else ([str(ns_list).lower()] if ns_list else None),
                         emails=[str(em).lower() for em in emails_list] if isinstance(emails_list, list) else ([str(emails_list).lower()] if emails_list else None),
                         status=[str(st) for st in status_list] if isinstance(status_list, list) else ([str(status_list)] if status_list else None)
                     )
-                    
                     if creation_dt:
                         now_dt = datetime.now(timezone.utc) if creation_dt.tzinfo else datetime.now()
-                        domain_age = (now_dt - creation_dt).days
-                        
-            except whois.parser.PywhoisError as e:
-                print(f"WHOIS lookup for {domain_for_whois_query} resulted in PywhoisError: {e}")
-            except Exception as e:
-                print(f"WHOIS lookup for {domain_for_whois_query} failed: {type(e).__name__} - {e}")
+                        domain_age_val = (now_dt - creation_dt).days
+            except whois.parser.PywhoisError as e_whois_parse: print(f"WHOIS parse error for {domain_for_whois_query}: {e_whois_parse}")
+            except Exception as e_whois: print(f"WHOIS error for {domain_for_whois_query}: {type(e_whois).__name__} - {e_whois}")
+        response_details.whois_info = whois_info_val
+        response_details.domain_actual_age_days = domain_age_val
+
+        # --- Sprawdzanie list zagrożeń ---
+        all_blacklist_checks: List[BlacklistCheckResult] = []
+        url_to_check_on_blacklists = request.url 
+        all_blacklist_checks.append(check_openphish(url_to_check_on_blacklists))
+        all_blacklist_checks.append(check_google_safe_browsing(url_to_check_on_blacklists))
+        if response_details.dns_records and 'A' in response_details.dns_records:
+            unique_ips_to_check = set()
+            for ip_addr in response_details.dns_records['A']:
+                if ip_addr and not ip_addr.startswith("Error:") and ip_addr not in unique_ips_to_check:
+                    all_blacklist_checks.append(check_ip_dnsbl(ip_addr))
+                    unique_ips_to_check.add(ip_addr)
+        response_details.blacklist_checks = all_blacklist_checks
         
-        response_details.whois_info = whois_data_obj
-        response_details.domain_actual_age_days = domain_age
+        try:
+            # Sprawdź wersję Pydantic lub po prostu spróbuj obu metod
+            try:
+                response_as_dict = response_details.model_dump(exclude_none=True, by_alias=True) # Pydantic v2+
+            except AttributeError:
+                response_as_dict = response_details.dict(exclude_none=True, by_alias=True) # Pydantic v1
+            
+            DOMAIN_ANALYSIS_CACHE[cache_key] = json.dumps(response_as_dict, default=pydantic_encoder)
+            print(f"Saved to cache: {cache_key}")
+        except Exception as e_cache_save: 
+            print(f"Error saving to cache for {cache_key}: {e_cache_save}")
         
         return response_details
 
-    except HTTPException:
+    except HTTPException: 
         raise
     except Exception as e:
-        print(f"Error in analyze_domain_details_endpoint: {type(e).__name__} - {e}")
-        return DomainDetailsResponse(error=f"An unexpected error occurred: {str(e)}")
+        print(f"Critical error in analyze_domain_details_endpoint: {type(e).__name__} - {e}")
+        error_domain_name = domain_name_from_url if domain_name_from_url else request.url
+        # Zwróć błąd w strukturze DomainDetailsResponse, aby klient nadal mógł go sparsować
+        # Nie cache'uj błędów krytycznych, aby umożliwić ponowną próbę
+        return DomainDetailsResponse(
+            domain_name=error_domain_name,
+            error=f"An critical unexpected error occurred: {str(e)}"
+        )
 
 # Uruchomienie: uvicorn main:app --reload
