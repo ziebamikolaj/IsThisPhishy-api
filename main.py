@@ -2,7 +2,7 @@ import os
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any, cast
+from typing import Optional, List, Dict, Any, cast, Set
 from urllib.parse import urlparse
 import dns.resolver
 from datetime import datetime, timezone
@@ -21,12 +21,14 @@ from transformers.modeling_utils import PreTrainedModel
 import torch
 from fastapi.middleware.cors import CORSMiddleware
 
-from cachetools import TTLCache, Cache
+from cachetools import TTLCache
 import json # Do serializacji/deserializacji obiektów Pydantic dla cache'u
 
 # --- Konfiguracja kluczy API i URL-i ---
 GOOGLE_SAFE_BROWSING_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "YOUR_GOOGLE_KEY_HERE_IF_NOT_IN_ENV")
 OPENPHISH_FEED_URL = "https://openphish.com/feed.txt"
+CERT_PL_FEED_URL = "https://hole.cert.pl/domains/v2/domains.txt"
+PHISHTANK_FEED_URL = "https://raw.githubusercontent.com/ProKn1fe/phishtank-database/master/online-valid.json"
 
 # --- Konfiguracja CORS ---
 app = FastAPI()
@@ -45,7 +47,7 @@ app.add_middleware(
 )
 
 # --- Ładowanie modelu i tokenizera ---
-MODEL_NAME = "ealvaradob/bert-finetuned-phishing"
+MODEL_NAME = "phishbot/ScamLLM"
 tokenizer_instance: Optional[PreTrainedTokenizerBase] = None
 model_instance: Optional[PreTrainedModel] = None
 
@@ -117,9 +119,61 @@ class DomainDetailsResponse(BaseModel):
 
 
 # --- Funkcje pomocnicze do sprawdzania list zagrożeń ---
-OPENPHISH_LOCAL_CACHE: List[str] = []
+
+# OpenPhish Cache
+OPENPHISH_LOCAL_CACHE: Set[str] = set() # <<< ZMIANA NA SET DLA WYDAJNOŚCI
 OPENPHISH_CACHE_TIMESTAMP: Optional[datetime] = None
 OPENPHISH_CACHE_TTL_SECONDS = 3600
+
+# CERT.PL Cache
+CERT_PL_LOCAL_CACHE: Set[str] = set()
+CERT_PL_CACHE_TIMESTAMP: Optional[datetime] = None
+CERT_PL_CACHE_TTL_SECONDS = 3600
+
+# PhishTank Cache
+PHISHTANK_LOCAL_CACHE: Set[str] = set()
+PHISHTANK_CACHE_TIMESTAMP: Optional[datetime] = None
+PHISHTANK_CACHE_TTL_SECONDS = 3600
+
+# <<< NOWA FUNKCJA POMOCNICZA DO GENEROWANIA WARIANÓW URL
+def generate_url_variations(url: str) -> Set[str]:
+    """Generates a set of URL variations for more robust blacklist checking."""
+    variations: Set[str] = set()
+    if not url:
+        return variations
+
+    # 1. Add the original URL
+    variations.add(url)
+
+    # 2. Handle trailing slash
+    if url.endswith('/'):
+        variations.add(url.rstrip('/'))
+    else:
+        variations.add(url + '/')
+
+    try:
+        # Ensure there's a scheme for proper parsing
+        schemed_url = url
+        if not url.startswith(('http://', 'https://')):
+            schemed_url = 'http://' + url
+
+        parsed = urlparse(schemed_url)
+        hostname = parsed.netloc
+        if hostname:
+            # 3. Add just the hostname
+            variations.add(hostname)
+
+            # 4. Handle 'www.' prefix
+            if hostname.startswith('www.'):
+                variations.add(hostname[4:])
+            else:
+                variations.add('www.' + hostname)
+    except Exception as e:
+        print(f"Could not parse URL '{url}' for variation generation: {e}")
+        # If parsing fails, we still have the original and slash variations
+
+    return variations
+
 
 def update_openphish_cache():
     global OPENPHISH_LOCAL_CACHE, OPENPHISH_CACHE_TIMESTAMP
@@ -130,7 +184,7 @@ def update_openphish_cache():
             headers = {'User-Agent': 'IsThisPhishyApp/1.0 (compatible; Python Requests)'}
             response = requests.get(OPENPHISH_FEED_URL, timeout=30, headers=headers)
             response.raise_for_status()
-            new_entries = [line.strip() for line in response.text.splitlines() if line.strip()]
+            new_entries = {line.strip() for line in response.text.splitlines() if line.strip()} # <<< ZMIANA NA SET
             if new_entries:
                 OPENPHISH_LOCAL_CACHE = new_entries
                 OPENPHISH_CACHE_TIMESTAMP = now
@@ -142,12 +196,91 @@ def update_openphish_cache():
         except requests.exceptions.RequestException as e:
             print(f"Error updating OpenPhish cache: {e}")
 
+def update_cert_pl_cache():
+    global CERT_PL_LOCAL_CACHE, CERT_PL_CACHE_TIMESTAMP
+    now = datetime.now(timezone.utc)
+    if CERT_PL_CACHE_TIMESTAMP is None or (now - CERT_PL_CACHE_TIMESTAMP).total_seconds() > CERT_PL_CACHE_TTL_SECONDS:
+        try:
+            print(f"Próba aktualizacji cache'u CERT.PL z {CERT_PL_FEED_URL}...")
+            headers = {'User-Agent': 'IsThisPhishyApp/1.0 (compatible; Python Requests)'}
+            response = requests.get(CERT_PL_FEED_URL, timeout=30, headers=headers)
+            response.raise_for_status()
+            new_entries = {line.strip() for line in response.text.splitlines() if line.strip()}
+            if new_entries:
+                CERT_PL_LOCAL_CACHE = new_entries
+                CERT_PL_CACHE_TIMESTAMP = now
+                print(f"Cache CERT.PL zaktualizowany pomyślnie, zawiera {len(CERT_PL_LOCAL_CACHE)} domen.")
+            else:
+                print("Plik z CERT.PL był pusty. Cache nie został zaktualizowany.")
+        except requests.exceptions.Timeout:
+            print(f"Timeout podczas aktualizacji cache'u CERT.PL z {CERT_PL_FEED_URL}.")
+        except requests.exceptions.RequestException as e:
+            print(f"Błąd podczas aktualizacji cache'u CERT.PL: {e}")
+
+def update_phishtank_cache():
+    global PHISHTANK_LOCAL_CACHE, PHISHTANK_CACHE_TIMESTAMP
+    now = datetime.now(timezone.utc)
+    if PHISHTANK_CACHE_TIMESTAMP is None or (now - PHISHTANK_CACHE_TIMESTAMP).total_seconds() > PHISHTANK_CACHE_TTL_SECONDS:
+        try:
+            print(f"Attempting to update PhishTank cache from {PHISHTANK_FEED_URL}...")
+            headers = {'User-Agent': 'IsThisPhishyApp/1.0 (compatible; Python Requests)'}
+            response = requests.get(PHISHTANK_FEED_URL, timeout=60, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            new_entries = {entry['url'] for entry in data if isinstance(entry, dict) and 'url' in entry}
+            if new_entries:
+                PHISHTANK_LOCAL_CACHE = new_entries
+                PHISHTANK_CACHE_TIMESTAMP = now
+                print(f"PhishTank cache updated successfully with {len(PHISHTANK_LOCAL_CACHE)} entries.")
+            else:
+                print("PhishTank feed was empty or in an unexpected format. Cache not updated.")
+        except requests.exceptions.Timeout:
+            print(f"Timeout while updating PhishTank cache from {PHISHTANK_FEED_URL}.")
+        except requests.exceptions.RequestException as e:
+            print(f"Error updating PhishTank cache: {e}")
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON from PhishTank: {e}")
+
+
 def check_openphish(url_to_check: str) -> BlacklistCheckResult:
     update_openphish_cache()
-    is_listed = url_to_check in OPENPHISH_LOCAL_CACHE
+    # <<< ZMIENIONA LOGIKA SPRAWDZANIA
+    url_variations = generate_url_variations(url_to_check)
+    
+    # Znajdź pierwszy pasujący wariant
+    found_match = next((v for v in url_variations if v in OPENPHISH_LOCAL_CACHE), None)
+    
+    is_listed = found_match is not None
+    details = {"match_found": is_listed, "cache_size": len(OPENPHISH_LOCAL_CACHE)}
     if is_listed:
-        print(f"URL '{url_to_check}' found in OpenPhish cache.")
-    return BlacklistCheckResult(source="OpenPhish", is_listed=is_listed, details={"match_found": is_listed, "cache_size": len(OPENPHISH_LOCAL_CACHE)})
+        print(f"URL variant '{found_match}' found in OpenPhish cache for original input '{url_to_check}'.")
+        details["matched_variant"] = found_match
+
+    return BlacklistCheckResult(source="OpenPhish", is_listed=is_listed, details=details)
+
+def check_cert_pl(domain_to_check: str) -> BlacklistCheckResult:
+    update_cert_pl_cache()
+    # CERT.PL is domain-based, so direct checking is usually sufficient and correct.
+    is_listed = domain_to_check in CERT_PL_LOCAL_CACHE
+    if is_listed:
+        print(f"Domena '{domain_to_check}' znaleziona w cache'u CERT.PL.")
+    return BlacklistCheckResult(source="CERT.PL", is_listed=is_listed, details={"match_found": is_listed, "cache_size": len(CERT_PL_LOCAL_CACHE)})
+
+def check_phishtank(url_to_check: str) -> BlacklistCheckResult:
+    update_phishtank_cache()
+    # <<< ZMIENIONA LOGIKA SPRAWDZANIA
+    url_variations = generate_url_variations(url_to_check)
+
+    found_match = next((v for v in url_variations if v in PHISHTANK_LOCAL_CACHE), None)
+    
+    is_listed = found_match is not None
+    details = {"match_found": is_listed, "cache_size": len(PHISHTANK_LOCAL_CACHE)}
+    if is_listed:
+        print(f"URL variant '{found_match}' found in PhishTank cache for original input '{url_to_check}'.")
+        details["matched_variant"] = found_match
+
+    return BlacklistCheckResult(source="PhishTank", is_listed=is_listed, details=details)
+
 
 def check_google_safe_browsing(url_to_check: str) -> BlacklistCheckResult:
     if not GOOGLE_SAFE_BROWSING_API_KEY or GOOGLE_SAFE_BROWSING_API_KEY.startswith("YOUR_"):
@@ -178,48 +311,49 @@ def check_ip_dnsbl(ip_address: str, dnsbl_server: str = "zen.spamhaus.org") -> B
     try:
         reversed_ip = '.'.join(reversed(ip_address.split('.')))
         query_domain = f"{reversed_ip}.{dnsbl_server}"
-        # print(f"Checking IP {ip_address} against DNSBL {dnsbl_server} (querying {query_domain})") # Zakomentowane dla czystszych logów
         answers = dns.resolver.resolve(query_domain, 'A')
         return BlacklistCheckResult(source=dnsbl_server, is_listed=True, details=[str(rdata) for rdata in answers])
     except dns.resolver.NXDOMAIN:
         return BlacklistCheckResult(source=dnsbl_server, is_listed=False)
     except (dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.exception.Timeout) as e:
-        # print(f"DNSBL lookup error for IP {ip_address} on {dnsbl_server}: {e}") # Zakomentowane
         return BlacklistCheckResult(source=dnsbl_server, is_listed=False, details=f"DNSBL lookup error: {e}")
     except Exception as e:
-        # print(f"Unexpected error during DNSBL check for IP {ip_address} on {dnsbl_server}: {e}") # Zakomentowane
         return BlacklistCheckResult(source=dnsbl_server, is_listed=False, details=f"Unexpected error: {e}")
 
 # --- Endpointy API ---
+CUSTOM_LABEL_MAP = {
+    0: "LEGITIMATE",
+    1: "PHISHING"
+}
+
 @app.post("/api/v1/check_phishing_text", response_model=PhishingCheckResponse)
 async def check_phishing_text(request: PhishingCheckRequest):
     if not tokenizer_instance or not model_instance:
         raise HTTPException(status_code=503, detail="Phishing detection model is not available.")
     try:
-        inputs = tokenizer_instance(request.text_to_analyze, return_tensors="pt", truncation=True, padding=True, max_length=512) # type: ignore[operator]
+        inputs = tokenizer_instance(request.text_to_analyze, return_tensors="pt", truncation=True, padding=True, max_length=512)
         with torch.no_grad():
-            outputs = model_instance(**inputs) # type: ignore[operator]
+            outputs = model_instance(**inputs)
             logits = outputs.logits
         
         probabilities = torch.softmax(logits, dim=1).squeeze()
         predicted_class_id = torch.argmax(probabilities).item()
-        confidence_value = probabilities[predicted_class_id].item() # type: ignore[index]
+        confidence_value = probabilities[predicted_class_id].item()
 
-        label_map_val = None
-        if hasattr(model_instance, 'config') and model_instance.config and hasattr(model_instance.config, 'id2label'):
-            label_map_val = model_instance.config.id2label
+        # <<< THIS IS THE FIX >>>
+        # Use our custom map to get the correct label, ignoring the model's generic config.
+        # The .get() method safely handles cases where the ID might not be in our map.
+        predicted_label = CUSTOM_LABEL_MAP.get(predicted_class_id, "UNKNOWN")
+
+        if predicted_label == "UNKNOWN":
+            print(f"Warning: Model produced an unknown class ID: {predicted_class_id}. Check model consistency.")
+
+        is_phishing_pred = (predicted_label == "PHISHING")
         
-        if label_map_val:
-            predicted_label = label_map_val[predicted_class_id]
-        else:
-            print("Warning: Model config or id2label not found. Using default labels.")
-            predicted_label = "PHISHING" if predicted_class_id == 1 else "LEGITIMATE"
-
-        is_phishing_pred = (predicted_label.lower() == "phishing")
         return PhishingCheckResponse(
             is_phishing=is_phishing_pred,
             confidence=confidence_value,
-            label=predicted_label.upper()
+            label=predicted_label
         )
     except Exception as e:
         print(f"Error during phishing prediction: {type(e).__name__} - {e}")
@@ -234,8 +368,7 @@ def format_rdn(rdn_sequence: Any) -> Optional[Dict[str, str]]:
                 if isinstance(rdn, tuple) and len(rdn) == 2 and isinstance(rdn[0], str) and isinstance(rdn[1], str):
                     formatted_dict[rdn[0]] = rdn[1]
         return formatted_dict if formatted_dict else None
-    except Exception as e:
-        # print(f"Error formatting RDN sequence: {e}, sequence was: {rdn_sequence}") # Zakomentowane
+    except Exception:
         return None
 
 def get_ssl_certificate_info(hostname: str, port: int = 443) -> Optional[SSLInfo]:
@@ -263,11 +396,9 @@ def get_ssl_certificate_info(hostname: str, port: int = 443) -> Optional[SSLInfo
                     except ValueError: pass
                 return SSLInfo(issuer=issuer_dict, subject=subject_dict, version=ssl_version,
                                serial_number=ssl_serial_number, not_before=ssl_not_before, not_after=ssl_not_after)
-    except (socket.gaierror, socket.timeout, ConnectionRefusedError, ssl.SSLError, OSError, ValueError) as e:
-        # print(f"SSL check error for {hostname}: {type(e).__name__} - {e}") # Zakomentowane
+    except (socket.gaierror, socket.timeout, ConnectionRefusedError, ssl.SSLError, OSError, ValueError):
         return None
-    except Exception as e:
-        # print(f"Unexpected SSL check error for {hostname}: {type(e).__name__} - {e}") # Zakomentowane
+    except Exception:
         return None
 
 def pydantic_encoder(obj: Any) -> Any:
@@ -284,7 +415,7 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
         try:
             cached_data = json.loads(cached_response_json)
             return DomainDetailsResponse(**cached_data)
-        except (json.JSONDecodeError, TypeError, Exception) as e: # TypeError dla Pydantic ValidationError
+        except (json.JSONDecodeError, TypeError, Exception) as e:
             print(f"Error decoding/validating cached JSON for {cache_key}: {e}. Fetching fresh data.")
             DOMAIN_ANALYSIS_CACHE.pop(cache_key, None)
 
@@ -337,12 +468,10 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
                 current_host_to_query = hostname_for_ops
                 resolved_values: Optional[List[str]] = None
                 try:
-                    # print(f"Attempting DNS lookup for: {current_host_to_query} [{record_type}]")
                     answers = dns.resolver.resolve(current_host_to_query, record_type)
                     resolved_values = [str(rdata) for rdata in answers]
                 except dns.resolver.NoAnswer:
                     if record_type in apex_fallback_record_types and apex_domain_for_dns and apex_domain_for_dns != current_host_to_query:
-                        # print(f"DNS NoAnswer for {current_host_to_query} [{record_type}]. Trying apex: {apex_domain_for_dns}")
                         try:
                             answers_apex = dns.resolver.resolve(apex_domain_for_dns, record_type)
                             resolved_values = [str(rdata) for rdata in answers_apex]
@@ -363,7 +492,6 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
         domain_age_val = None
         if not is_ip_in_url and domain_for_whois_query:
             try:
-                # print(f"Attempting WHOIS lookup for: {domain_for_whois_query}")
                 domain_whois_info = whois.whois(domain_for_whois_query)
                 if domain_whois_info and (getattr(domain_whois_info, 'domain_name', None) or domain_whois_info.get('domain_name')):
                     def normalize_date_list(date_val: Any) -> Optional[datetime]:
@@ -393,9 +521,15 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
 
         # --- Sprawdzanie list zagrożeń ---
         all_blacklist_checks: List[BlacklistCheckResult] = []
-        url_to_check_on_blacklists = request.url 
+        url_to_check_on_blacklists = request.url
+        
+        if not is_ip_in_url and domain_for_whois_query:
+            all_blacklist_checks.append(check_cert_pl(domain_for_whois_query))
+
+        all_blacklist_checks.append(check_phishtank(url_to_check_on_blacklists))
         all_blacklist_checks.append(check_openphish(url_to_check_on_blacklists))
         all_blacklist_checks.append(check_google_safe_browsing(url_to_check_on_blacklists))
+        
         if response_details.dns_records and 'A' in response_details.dns_records:
             unique_ips_to_check = set()
             for ip_addr in response_details.dns_records['A']:
@@ -405,11 +539,10 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
         response_details.blacklist_checks = all_blacklist_checks
         
         try:
-            # Sprawdź wersję Pydantic lub po prostu spróbuj obu metod
             try:
-                response_as_dict = response_details.model_dump(exclude_none=True, by_alias=True) # Pydantic v2+
+                response_as_dict = response_details.model_dump(exclude_none=True, by_alias=True)
             except AttributeError:
-                response_as_dict = response_details.dict(exclude_none=True, by_alias=True) # Pydantic v1
+                response_as_dict = response_details.dict(exclude_none=True, by_alias=True)
             
             DOMAIN_ANALYSIS_CACHE[cache_key] = json.dumps(response_as_dict, default=pydantic_encoder)
             print(f"Saved to cache: {cache_key}")
@@ -423,8 +556,6 @@ async def analyze_domain_details_endpoint(request: DomainAnalysisRequest):
     except Exception as e:
         print(f"Critical error in analyze_domain_details_endpoint: {type(e).__name__} - {e}")
         error_domain_name = domain_name_from_url if domain_name_from_url else request.url
-        # Zwróć błąd w strukturze DomainDetailsResponse, aby klient nadal mógł go sparsować
-        # Nie cache'uj błędów krytycznych, aby umożliwić ponowną próbę
         return DomainDetailsResponse(
             domain_name=error_domain_name,
             error=f"An critical unexpected error occurred: {str(e)}"
