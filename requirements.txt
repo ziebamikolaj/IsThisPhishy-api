@@ -8,7 +8,7 @@ colorama==0.4.6
 dnspython==2.7.0
 dotenv==0.9.9
 fastapi==0.115.13
-filelock==3.18.0
+filelock==3.20.3
 fsspec==2025.5.1
 h11==0.16.0
 huggingface-hub==0.33.0
